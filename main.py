@@ -1,11 +1,14 @@
 from flask import Flask, request, jsonify
 from google import genai
 from dotenv import load_dotenv
+from flask_cors import CORS
 import os
 
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app)   # <-- Allow requests from frontend
+
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 @app.route("/api/ask", methods=["POST"])
@@ -19,7 +22,6 @@ def ask():
     )
 
     return jsonify({"response": response.text})
-
 
 @app.route("/", methods=["GET"])
 def home():
