@@ -83,6 +83,18 @@ Your task:
 Be concise, accurate, and professional.
 """
 
+# ✅ NEW: RAG System Prompt (BSE based)
+RAG_SYSTEM_PROMPT = """
+You are a knowledgeable assistant focused on BSE (Bombay Stock Exchange) and related topics.
+
+Rules:
+1) Answer the user's question ONLY using the provided RAG context (Knowledge Base).
+2) If the answer is not found in the context, respond with:
+   "I could not find this in the knowledge base."
+3) Do not assume or invent facts.
+4) Be clear, concise, and professional.
+"""
+
 # ---------------- UTILS ---------------- #
 
 def build_llm_context(tavily_response, max_chars=3000):
@@ -97,6 +109,46 @@ def build_llm_context(tavily_response, max_chars=3000):
 
     full_context = "\n\n---\n\n".join(context_chunks)
     return full_context[:max_chars]
+
+
+# ✅ NEW: Dummy RAG KB (Replace with your real vector DB later)
+BSE_KNOWLEDGE_BASE = [
+    {
+        "title": "What is BSE?",
+        "content": "BSE (Bombay Stock Exchange) is India's oldest stock exchange, located in Mumbai. It provides trading in equities, derivatives, debt instruments, and mutual funds."
+    },
+    {
+        "title": "BSE Sensex",
+        "content": "The BSE Sensex (Sensitive Index) is the benchmark index of BSE, consisting of 30 financially sound and well-established companies across major sectors."
+    },
+    {
+        "title": "BSE Listing",
+        "content": "Companies list on BSE to raise capital by issuing shares to the public. Listed firms must comply with SEBI and exchange regulations."
+    },
+]
+
+def rag_search(query, top_k=3):
+    """
+    Simple keyword-based retrieval.
+    Later you can replace this with embeddings + FAISS/Chroma/Pinecone.
+    """
+    query_lower = query.lower()
+    scored = []
+    for doc in BSE_KNOWLEDGE_BASE:
+        text = (doc["title"] + " " + doc["content"]).lower()
+        score = sum(1 for word in query_lower.split() if word in text)
+        if score > 0:
+            scored.append((score, doc))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored[:top_k]]
+
+def build_rag_context(docs, max_chars=5000):
+    chunks = []
+    for d in docs:
+        chunks.append(f"Title: {d['title']}\nContent: {d['content']}")
+    context = "\n\n---\n\n".join(chunks)
+    return context[:max_chars]
 
 
 # ---------------- ROUTES ---------------- #
@@ -165,6 +217,45 @@ WEB CONTEXT:
     return jsonify({
         "response": response.text,
         "sources": [r.get("url") for r in tavily_response.get("results", [])]
+    })
+
+
+# ✅ NEW: RAG Search Chat (BSE KB)
+@app.route("/api/ragsearch", methods=["POST"])
+def ragsearch_chat():
+    data = request.json or {}
+    user_prompt = data.get("prompt", "")
+
+    if not user_prompt.strip():
+        return jsonify({"response": "Please enter a valid prompt."}), 400
+
+    # retrieve docs from kb
+    docs = rag_search(user_prompt, top_k=3)
+
+    if not docs:
+        return jsonify({"response": "I could not find this in the knowledge base.", "sources": []})
+
+    rag_context = build_rag_context(docs)
+
+    user_message = f"""
+RAG CONTEXT:
+{rag_context}
+
+Question:
+{user_prompt}
+"""
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=user_message,
+        config=types.GenerateContentConfig(
+            system_instruction=RAG_SYSTEM_PROMPT
+        )
+    )
+
+    return jsonify({
+        "response": response.text,
+        "sources": [d["title"] for d in docs]
     })
 
 
