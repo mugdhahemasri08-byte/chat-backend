@@ -4,3 +4,4 @@ google-genai
 gunicorn
 flask-cors
 tavily-python
+pypdf
