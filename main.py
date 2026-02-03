@@ -5,6 +5,7 @@ from google.genai import types
 from tavily import TavilyClient
 from pypdf import PdfReader
 from dotenv import load_dotenv
+from supabase import create_client
 import os
 import uuid
 
@@ -18,8 +19,17 @@ CORS(app)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # use service role key
+
 if not GOOGLE_API_KEY:
     raise ValueError("❌ GOOGLE_API_KEY / GEMINI_API_KEY is missing in .env")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("❌ SUPABASE_URL / SUPABASE_KEY missing in .env")
+
+if not SUPABASE_URL.endswith("/"):
+    SUPABASE_URL += "/"
 
 # Tavily only required for websearch
 if not TAVILY_API_KEY:
@@ -27,6 +37,8 @@ if not TAVILY_API_KEY:
 
 # ------------------ CLIENTS ------------------ #
 client = genai.Client(api_key=GOOGLE_API_KEY)
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 tavily_client = None
 if TAVILY_API_KEY:
@@ -83,7 +95,6 @@ Your task:
 Be concise, accurate, and professional.
 """
 
-# ✅ NEW: RAG System Prompt (BSE based)
 RAG_SYSTEM_PROMPT = """
 You are a knowledgeable assistant focused on BSE (Bombay Stock Exchange) and related topics.
 
@@ -111,43 +122,41 @@ def build_llm_context(tavily_response, max_chars=3000):
     return full_context[:max_chars]
 
 
-# ✅ NEW: Dummy RAG KB (Replace with your real vector DB later)
-BSE_KNOWLEDGE_BASE = [
-    {
-        "title": "What is BSE?",
-        "content": "BSE (Bombay Stock Exchange) is India's oldest stock exchange, located in Mumbai. It provides trading in equities, derivatives, debt instruments, and mutual funds."
-    },
-    {
-        "title": "BSE Sensex",
-        "content": "The BSE Sensex (Sensitive Index) is the benchmark index of BSE, consisting of 30 financially sound and well-established companies across major sectors."
-    },
-    {
-        "title": "BSE Listing",
-        "content": "Companies list on BSE to raise capital by issuing shares to the public. Listed firms must comply with SEBI and exchange regulations."
-    },
-]
+# ✅ NEW: Supabase RAG functions
+def get_embedding(text: str):
+    res = client.models.embed_content(
+        model="text-embedding-004",
+        contents=text
+    )
+    return res.embeddings[0].values
 
-def rag_search(query, top_k=3):
+
+def supabase_rag_retrieve(query: str, top_k=5, threshold=0.15):
+    q_emb = get_embedding(query)
+
+    res = supabase.rpc(
+        "match_documents",
+        {
+            "query_embedding": q_emb,
+            "match_threshold": threshold,
+            "match_count": top_k
+        }
+    ).execute()
+
+    return res.data or []
+
+
+def build_supabase_rag_context(matches, max_chars=6000):
     """
-    Simple keyword-based retrieval.
-    Later you can replace this with embeddings + FAISS/Chroma/Pinecone.
+    Convert retrieved Supabase matches into context string
     """
-    query_lower = query.lower()
-    scored = []
-    for doc in BSE_KNOWLEDGE_BASE:
-        text = (doc["title"] + " " + doc["content"]).lower()
-        score = sum(1 for word in query_lower.split() if word in text)
-        if score > 0:
-            scored.append((score, doc))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [doc for _, doc in scored[:top_k]]
-
-def build_rag_context(docs, max_chars=5000):
-    chunks = []
-    for d in docs:
-        chunks.append(f"Title: {d['title']}\nContent: {d['content']}")
-    context = "\n\n---\n\n".join(chunks)
+    parts = []
+    for m in matches:
+        parts.append(
+            f"[SOURCE: {m['file_name']} | chunk={m['chunk_index']} | sim={round(m['similarity'], 3)}]\n"
+            f"{m['content']}"
+        )
+    context = "\n\n---\n\n".join(parts)
     return context[:max_chars]
 
 
@@ -220,7 +229,7 @@ WEB CONTEXT:
     })
 
 
-# ✅ NEW: RAG Search Chat (BSE KB)
+# ✅ UPDATED: Supabase Vector RAG Search Endpoint
 @app.route("/api/ragsearch", methods=["POST"])
 def ragsearch_chat():
     data = request.json or {}
@@ -229,13 +238,13 @@ def ragsearch_chat():
     if not user_prompt.strip():
         return jsonify({"response": "Please enter a valid prompt."}), 400
 
-    # retrieve docs from kb
-    docs = rag_search(user_prompt, top_k=3)
+    # retrieve matches from Supabase
+    matches = supabase_rag_retrieve(user_prompt, top_k=5, threshold=0.15)
 
-    if not docs:
+    if not matches:
         return jsonify({"response": "I could not find this in the knowledge base.", "sources": []})
 
-    rag_context = build_rag_context(docs)
+    rag_context = build_supabase_rag_context(matches)
 
     user_message = f"""
 RAG CONTEXT:
@@ -245,6 +254,7 @@ Question:
 {user_prompt}
 """
 
+    # ⚠️ use model that works in your API env
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=user_message,
@@ -253,9 +263,18 @@ Question:
         )
     )
 
+    sources = []
+    for m in matches:
+        sources.append({
+            "file_name": m["file_name"],
+            "file_url": m["file_url"],
+            "chunk_index": m["chunk_index"],
+            "similarity": m["similarity"]
+        })
+
     return jsonify({
         "response": response.text,
-        "sources": [d["title"] for d in docs]
+        "sources": sources
     })
 
 
