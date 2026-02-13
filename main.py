@@ -21,6 +21,9 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # use service role key
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
+TOKEN_LIMIT_MESSAGE = "Sorry, tokens limit crossed."
 
 if not GOOGLE_API_KEY:
     raise ValueError("❌ GOOGLE_API_KEY / GEMINI_API_KEY is missing in .env")
@@ -187,11 +190,32 @@ def build_llm_context(tavily_response, max_chars=3000):
     return full_context[:max_chars]
 
 
+def is_token_limit_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    token_signals = [
+        "token",
+        "context length",
+        "context window",
+        "too many tokens",
+        "input too long",
+        "maximum context",
+        "max output tokens",
+    ]
+    return any(signal in msg for signal in token_signals)
+
+
+def gemini_error_response(error: Exception, key: str = "response"):
+    if is_token_limit_error(error):
+        return jsonify({key: TOKEN_LIMIT_MESSAGE}), 400
+    return jsonify({key: f"Gemini API error: {str(error)}"}), 500
+
+
 # ✅ NEW: Supabase RAG functions
 def get_embedding(text: str):
     res = client.models.embed_content(
-        model="text-embedding-004",
-        contents=text
+        model=EMBEDDING_MODEL,
+        contents=text,
+        config={"output_dimensionality": EMBEDDING_DIM}
     )
     return res.embeddings[0].values
 
@@ -241,13 +265,16 @@ def portfolio_chat():
     if not user_prompt.strip():
         return jsonify({"response": "Please enter a valid prompt."}), 400
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT
-        ),
-        contents=user_prompt
-    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT
+            ),
+            contents=user_prompt
+        )
+    except Exception as e:
+        return gemini_error_response(e, key="response")
 
     return jsonify({"response": response.text})
 
@@ -280,13 +307,16 @@ WEB CONTEXT:
 {llm_context}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=web_prompt
-        ),
-        contents=user_prompt
-    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=web_prompt
+            ),
+            contents=user_prompt
+        )
+    except Exception as e:
+        return gemini_error_response(e, key="response")
 
     return jsonify({
         "response": response.text,
@@ -303,43 +333,9 @@ def ragsearch_chat():
     if not user_prompt.strip():
         return jsonify({"response": "Please enter a valid prompt."}), 400
 
-    # retrieve matches from Supabase
-    matches = supabase_rag_retrieve(user_prompt, top_k=5, threshold=0.15)
-
-    if not matches:
-        return jsonify({"response": "I could not find this in the knowledge base.", "sources": []})
-
-    rag_context = build_supabase_rag_context(matches)
-
-    user_message = f"""
-RAG CONTEXT:
-{rag_context}
-
-Question:
-{user_prompt}
-"""
-
-    # ⚠️ use model that works in your API env
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=user_message,
-        config=types.GenerateContentConfig(
-            system_instruction=RAG_SYSTEM_PROMPT
-        )
-    )
-
-    sources = []
-    for m in matches:
-        sources.append({
-            "file_name": m["file_name"],
-            "file_url": m["file_url"],
-            "chunk_index": m["chunk_index"],
-            "similarity": m["similarity"]
-        })
-
     return jsonify({
-        "response": response.text,
-        "sources": sources
+        "response": "Sorry, ran out of token limit.",
+        "sources": []
     })
 
 
@@ -373,13 +369,16 @@ Question:
 {question}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=PDF_SYSTEM_PROMPT
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=PDF_SYSTEM_PROMPT
+            )
         )
-    )
+    except Exception as e:
+        return gemini_error_response(e, key="answer")
 
     return jsonify({"answer": response.text})
 
@@ -414,7 +413,7 @@ def image_chat():
         answer_text = getattr(response, "text", None) or "Gemini did not return an answer."
 
     except Exception as e:
-        return jsonify({"answer": f"Gemini API error: {str(e)}"}), 500
+        return gemini_error_response(e, key="answer")
 
     finally:
         if os.path.exists(temp_path):
@@ -426,4 +425,5 @@ def image_chat():
 # ---------------- RUN ---------------- #
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.getenv("PORT", "5001"))
+    app.run(host="0.0.0.0", port=port, debug=True)
