@@ -16,7 +16,6 @@ app = Flask(__name__)
 CORS(app)
 
 # ------------------ ENV KEYS ------------------ #
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -25,8 +24,39 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
 TOKEN_LIMIT_MESSAGE = "Sorry, tokens limit crossed."
 
-if not GOOGLE_API_KEY:
-    raise ValueError("❌ GOOGLE_API_KEY / GEMINI_API_KEY is missing in .env")
+
+def load_google_api_keys():
+    """Load Gemini API keys in priority order and deduplicate while preserving order."""
+    keys = []
+    for env_name in [
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY_1",
+        "GEMINI_API_KEY_1",
+    ]:
+        value = (os.getenv(env_name) or "").strip()
+        if value:
+            keys.append(value)
+
+    csv_keys = (os.getenv("GOOGLE_API_KEYS") or "").strip()
+    if csv_keys:
+        keys.extend([k.strip() for k in csv_keys.split(",") if k.strip()])
+
+    deduped = []
+    seen = set()
+    for key in keys:
+        if key not in seen:
+            deduped.append(key)
+            seen.add(key)
+    return deduped
+
+
+GOOGLE_API_KEYS = load_google_api_keys()
+
+if not GOOGLE_API_KEYS:
+    raise ValueError(
+        "❌ No Gemini API keys found. Add GOOGLE_API_KEY / GEMINI_API_KEY or fallback keys like GOOGLE_API_KEY_1."
+    )
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("❌ SUPABASE_URL / SUPABASE_KEY missing in .env")
@@ -39,7 +69,7 @@ if not TAVILY_API_KEY:
     print("⚠️ TAVILY_API_KEY missing. /api/websearch will not work.")
 
 # ------------------ CLIENTS ------------------ #
-client = genai.Client(api_key=GOOGLE_API_KEY)
+genai_clients = [genai.Client(api_key=key) for key in GOOGLE_API_KEYS]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -204,6 +234,53 @@ def is_token_limit_error(error: Exception) -> bool:
     return any(signal in msg for signal in token_signals)
 
 
+def should_fallback_key(error: Exception) -> bool:
+    msg = str(error).lower()
+    fallback_signals = [
+        "api key",
+        "invalid key",
+        "permission denied",
+        "unauthorized",
+        "forbidden",
+        "403",
+        "401",
+        "quota",
+        "rate limit",
+        "resource exhausted",
+        "billing",
+    ]
+    return any(signal in msg for signal in fallback_signals)
+
+
+def run_with_genai_fallback(operation):
+    """
+    Try the same Gemini operation with each configured API key until one succeeds.
+    Token-limit errors are returned immediately to preserve existing UX.
+    """
+    last_error = None
+
+    for idx, gclient in enumerate(genai_clients):
+        try:
+            return operation(gclient)
+        except Exception as e:
+            last_error = e
+
+            if is_token_limit_error(e):
+                raise
+
+            is_last_key = idx == len(genai_clients) - 1
+            if is_last_key:
+                raise
+
+            # Retry on known key/quota/auth issues; if uncertain, still continue to next key.
+            if should_fallback_key(e):
+                continue
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Gemini fallback failed without a captured exception.")
+
+
 def gemini_error_response(error: Exception, key: str = "response"):
     if is_token_limit_error(error):
         return jsonify({key: TOKEN_LIMIT_MESSAGE}), 400
@@ -212,11 +289,14 @@ def gemini_error_response(error: Exception, key: str = "response"):
 
 # ✅ NEW: Supabase RAG functions
 def get_embedding(text: str):
-    res = client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=text,
-        config={"output_dimensionality": EMBEDDING_DIM}
-    )
+    def _embed(gclient):
+        return gclient.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=text,
+            config={"output_dimensionality": EMBEDDING_DIM}
+        )
+
+    res = run_with_genai_fallback(_embed)
     return res.embeddings[0].values
 
 
@@ -266,12 +346,14 @@ def portfolio_chat():
         return jsonify({"response": "Please enter a valid prompt."}), 400
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT
-            ),
-            contents=user_prompt
+        response = run_with_genai_fallback(
+            lambda gclient: gclient.models.generate_content(
+                model="gemini-2.5-flash",
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT
+                ),
+                contents=user_prompt
+            )
         )
     except Exception as e:
         return gemini_error_response(e, key="response")
@@ -308,12 +390,14 @@ WEB CONTEXT:
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            config=types.GenerateContentConfig(
-                system_instruction=web_prompt
-            ),
-            contents=user_prompt
+        response = run_with_genai_fallback(
+            lambda gclient: gclient.models.generate_content(
+                model="gemini-2.5-flash",
+                config=types.GenerateContentConfig(
+                    system_instruction=web_prompt
+                ),
+                contents=user_prompt
+            )
         )
     except Exception as e:
         return gemini_error_response(e, key="response")
@@ -370,11 +454,13 @@ Question:
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=PDF_SYSTEM_PROMPT
+        response = run_with_genai_fallback(
+            lambda gclient: gclient.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=PDF_SYSTEM_PROMPT
+                )
             )
         )
     except Exception as e:
@@ -400,15 +486,17 @@ def image_chat():
     image_file.save(temp_path)
 
     try:
-        uploaded_file = client.files.upload(file=temp_path)
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[uploaded_file, f"Question: {question}"],
-            config=types.GenerateContentConfig(
-                system_instruction=IMAGE_SYSTEM_PROMPT
+        def _image_flow(gclient):
+            uploaded_file = gclient.files.upload(file=temp_path)
+            return gclient.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[uploaded_file, f"Question: {question}"],
+                config=types.GenerateContentConfig(
+                    system_instruction=IMAGE_SYSTEM_PROMPT
+                )
             )
-        )
+
+        response = run_with_genai_fallback(_image_flow)
 
         answer_text = getattr(response, "text", None) or "Gemini did not return an answer."
 
